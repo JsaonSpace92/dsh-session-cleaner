@@ -4,14 +4,17 @@ import { readFile } from 'node:fs/promises';
 import { runInNewContext } from 'node:vm';
 
 const source = await readFile(new URL('../client.js', import.meta.url), 'utf8');
-const row = { id: 'session-test', title: '归档测试', group: 'archived', cwd: '/项目', bytes: 42, createdAt: 1, running: false };
-const deletedRow = { id: 'session-del', title: '遗留对话', group: 'deleted', cwd: '/已删工作区', formerWorkspace: '已删工作区', bytes: 84, createdAt: 1, running: false };
+const row = { id: 'session-test', title: '归档测试', group: 'archived', archived: true, cwd: '/项目', workspaceTitle: '项目', bytes: 42, createdAt: 1, running: false };
+const deletedRow = { id: 'session-del', title: '遗留对话', group: 'deleted', archived: false, cwd: '/已删工作区', formerWorkspace: '已删工作区', bytes: 84, createdAt: 1, running: false };
+const activeRow = { id: 'session-act', title: '未归档对话', group: 'associated', archived: false, cwd: '/项目', workspaceTitle: '项目', bytes: 120, createdAt: 2, running: false };
 const scan = nonce => ({
   rows: [row, deletedRow],
-  counts: { archived: 1, deleted: 1, unassociated: 0, unknown: 0 },
+  allSessions: [activeRow, row, deletedRow],
+  workspaces: [{ id: 'ws-1', title: '项目', path: '/项目', sessionIds: ['session-act', 'session-test'], totalCount: 2, activeCount: 1, archivedCount: 1, runningCount: 0, bytes: 162 }],
+  counts: { archived: 1, deleted: 1, unassociated: 0, unknown: 0, all_sessions: 3, all_workspaces: 1 },
   formerWorkspaces: [{ key: '/已删工作区', title: '已删工作区', cwd: '/已删工作区', sessionIds: ['session-del'], bytes: 84 }],
   nonce,
-  version: '0.2.0',
+  version: '0.3.0',
 });
 const preview = { selected: [row], retainedChildren: [], cascadeChildren: [], bytes: 42 };
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status });
@@ -73,7 +76,7 @@ test('实际按钮在旧令牌失效后重新读取并打开预览，不重复�
       return response(scan(++reads === 1 ? '旧令牌' : '新令牌'));
     }
     posts++;
-    assert.deepEqual(JSON.parse(options.body), { action: 'preview', ids: ['session-test'] });
+    assert.deepEqual(JSON.parse(options.body), { action: 'preview', ids: ['session-test'], allowActiveWorkspace: false });
     assert.equal(options.headers['x-dsh-cleaner'], posts === 1 ? '旧令牌' : '新令牌');
     return posts === 1 ? response({ code: 'PANEL_EXPIRED', error: '面板已更新' }, 409) : response(preview);
   });
@@ -133,8 +136,60 @@ test('已删除工作区视图支持按原工作区一键触发清理预览', as
   const wsBtn = button(ui.render(), '删除该工作区会话');
   assert.ok(wsBtn);
   await wsBtn.props.onClick();
-  assert.deepEqual(previewed, [{ action: 'preview', ids: ['session-del'] }]);
+  assert.deepEqual(previewed, [{ action: 'preview', ids: ['session-del'], allowActiveWorkspace: false }]);
   assert.ok(find(ui.render(), node => node.props.role === 'dialog'));
+});
+
+test('所有对话与所有工作区板块支持一键导出对话、导出整工作区压缩包与删除工作区', async () => {
+  const actions = [];
+  const removed = [];
+  const ui = await mount(async (url, options) => {
+    if (url === '/session-cleaner/v1') return response(scan('令牌'));
+    const input = JSON.parse(options.body);
+    actions.push(input);
+    if (input.action === 'export-sessions') {
+      return response({ filename: '测试导出.zip', mediaType: 'application/zip', base64: '', savedPath: '/exports/测试导出.zip', count: 1 });
+    }
+    if (input.action === 'export-workspace') {
+      return response({ filename: '项目-对话日志.zip', mediaType: 'application/zip', base64: '', savedPath: '/exports/项目-对话日志.zip', count: 2, message: '已导出工作区「项目」' });
+    }
+    if (input.action === 'delete-workspace') {
+      return response({
+        ...scan('令牌'),
+        workspaces: [],
+        counts: { archived: 0, deleted: 1, unassociated: 0, unknown: 0, all_sessions: 1, all_workspaces: 0 },
+        deletedIds: ['session-act', 'session-test'],
+        message: '已删除工作区「项目」及其 2 条对话记录。',
+      });
+    }
+  }, {
+    handleSessionRemoved: id => removed.push(id),
+    refresh: async () => {},
+  });
+
+  const allSessionsTab = find(ui.render(), node => node.props.role === 'tab' && find(node, child => child.children?.includes('所有对话')));
+  allSessionsTab.props.onClick();
+  const exportBtn = button(ui.render(), '↓ 导出对话');
+  assert.ok(exportBtn);
+  await exportBtn.props.onClick();
+  assert.deepEqual(actions[0], { action: 'export-sessions', ids: ['session-act'], format: 'zip' });
+
+  const allWsTab = find(ui.render(), node => node.props.role === 'tab' && find(node, child => child.children?.includes('所有工作区')));
+  allWsTab.props.onClick();
+  const exportWsBtn = button(ui.render(), '↓ 导出工作区压缩包 (.zip)');
+  assert.ok(exportWsBtn);
+  await exportWsBtn.props.onClick();
+  assert.deepEqual(actions[1], { action: 'export-workspace', workspaceId: 'ws-1', format: 'zip' });
+
+  const delWsBtn = button(ui.render(), '删除工作区及对话');
+  assert.ok(delWsBtn);
+  delWsBtn.props.onClick();
+  const dialog = find(ui.render(), node => node.props.role === 'dialog');
+  assert.ok(dialog);
+  const confirmDelWs = button(dialog, '确定删除工作区及对话');
+  await confirmDelWs.props.onClick();
+  assert.deepEqual(actions[2], { action: 'delete-workspace', workspaceId: 'ws-1', confirmed: true });
+  assert.deepEqual(removed, ['session-act', 'session-test']);
 });
 
 test('登录或权限失败直接显示原因，不重试操作', async () => {

@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-cleaner",
-  "version": "0.2.1",
-  "description": "为 DSH 分类清理已归档会话、已删除工作区遗留会话与未关联会话，保留本地磁盘项目文件。",
+  "version": "0.3.0",
+  "description": "为 DSH 提供对话与工作区一站式管理：支持一键导出单条/批量对话与整工作区 .zip 压缩包，分类清理已归档会话、已删除工作区遗留会话及连根删除工作区，100% 保留本地磁盘项目文件。",
   "type": "module",
   "license": "MIT",
   "engines": { "node": ">=22", "dsh": ">=0.2.2-rc.1 <0.3.0" },

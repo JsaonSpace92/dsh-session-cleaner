@@ -1,9 +1,26 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto';
-import { readFile, mkdir, readdir, rm } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, readdir, rm } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { GROUPS, atomicJson, canonical, classify, collectDescendants, digest, inside, observeWorkspaces, optionalJson, snapshotFiles } from './core.js';
+import {
+  GROUPS,
+  atomicJson,
+  canonical,
+  classify,
+  classifyAll,
+  collectDescendants,
+  createZipBuffer,
+  digest,
+  formatSessionJsonl,
+  formatSessionMarkdown,
+  inside,
+  observeWorkspaces,
+  optionalJson,
+  sanitizeFileName,
+  snapshotFiles,
+  summarizeWorkspaces,
+} from './core.js';
 
 export const name = 'dsh-session-cleaner';
 export const inject = ['webServer', 'connection', 'sessionPersistence', 'sessionController', 'workspaceRegistry', 'storageDomain', 'tools'];
@@ -41,7 +58,15 @@ export class SessionCleaner {
     const liveResult = await this.ctx.sessionController.list({}, new AbortController().signal);
     const live = new Map(liveResult.items.map(item => [item.sessionId, item]));
     const autoInferDeleted = options.autoInferDeleted ?? true;
-    const rows = classify(snapshots, this.ctx.workspaceRegistry.list(), this.domain().global.get().archivedSessionIds || [], this.history, live, { autoInferDeleted });
+    const workspaceList = this.ctx.workspaceRegistry.list();
+    const archivedIds = this.domain().global.get().archivedSessionIds || [];
+    const allRows = classifyAll(snapshots, workspaceList, archivedIds, this.history, live, { autoInferDeleted });
+    const rows = allRows.filter(row => row.group !== 'associated');
+    const allSessions = allRows
+      .filter(row => !row.isSubagent || row.archived)
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    const workspaces = summarizeWorkspaces(workspaceList, allRows, snapshots);
+
     const formerWorkspacesMap = new Map();
     for (const row of rows) {
       if (row.group !== 'deleted') continue;
@@ -54,19 +79,29 @@ export class SessionCleaner {
       item.sessionIds.push(row.id);
       item.bytes += row.bytes;
     }
+
+    const counts = {
+      ...Object.fromEntries(GROUPS.map(group => [group, rows.filter(row => row.group === group).length])),
+      all_sessions: allSessions.length,
+      all_workspaces: workspaces.length,
+    };
+
     return {
       rows,
-      counts: Object.fromEntries(GROUPS.map(group => [group, rows.filter(row => row.group === group).length])),
+      allSessions,
+      workspaces,
+      counts,
       formerWorkspaces: [...formerWorkspacesMap.values()],
       trackedSince: this.history.since || null,
       limitations: ['删除后将永久移除 DSH 会话日志、归档/置顶引用及缓存；本地磁盘上的项目代码与文件夹始终保留。', '全局去重的共享附件保持保留；已派生的独立会话副本保持保留。'],
       historyError: this.historyError || null,
     };
   }
-  async preview(ids) {
+  async preview(ids, options = {}) {
     if (!Array.isArray(ids) || !ids.length || ids.length > 1000 || ids.some(id => typeof id !== 'string')) throw new Error('请选择 1–1000 个会话。');
     const scan = await this.scan();
-    const byId = new Map(scan.rows.map(row => [row.id, row]));
+    const pool = options.allowActiveWorkspace ? scan.allSessions : scan.rows;
+    const byId = new Map(pool.map(row => [row.id, row]));
     const selected = [...new Set(ids)].map(id => {
       const row = byId.get(id);
       if (!row || row.running) throw new Error('所选会话已变化或仍在运行，请刷新后重选。');
@@ -111,9 +146,186 @@ export class SessionCleaner {
     }
     return { storage, workspacePath, workspaceBytes };
   }
+  async readSessionEvents(id) {
+    if (typeof this.ctx.sessionPersistence.open === 'function') {
+      const handle = await this.ctx.sessionPersistence.open(id, 'read');
+      try {
+        const result = await handle.read();
+        return Array.isArray(result?.events) ? result.events : [];
+      } finally {
+        await handle.close?.();
+      }
+    }
+    const stat = await this.ctx.sessionPersistence.stat(id);
+    if (stat?.location?.path && !stat.location.path.endsWith('.zstd')) {
+      try {
+        const raw = await readFile(stat.location.path, 'utf8');
+        const lines = raw.split('\n').map(line => line.trim()).filter(Boolean);
+        const events = [];
+        for (const line of lines) {
+          try {
+            const parsed = JSON.parse(line);
+            if (parsed && parsed.type && parsed.type !== 'session/header') events.push(parsed);
+          } catch {}
+        }
+        return events;
+      } catch {}
+    }
+    return [];
+  }
+  async exportSessions(ids, options = {}) {
+    if (!Array.isArray(ids) || !ids.length || ids.length > 1000 || ids.some(id => typeof id !== 'string')) {
+      throw new Error('请选择 1–1000 个要导出的对话。');
+    }
+    const format = ['zip', 'md', 'jsonl'].includes(options.format) ? options.format : 'zip';
+    await this.ctx.sessionPersistence.flush();
+    const scan = await this.scan();
+    const snapshots = await this.ctx.sessionPersistence.list();
+    const snapshotById = new Map(snapshots.map(item => [item.header.id, item]));
+    const rowById = new Map([...scan.allSessions, ...scan.rows].map(row => [row.id, row]));
+
+    const uniqueIds = [...new Set(ids)];
+    const records = [];
+    for (const id of uniqueIds) {
+      const snapshot = snapshotById.get(id);
+      if (!snapshot) throw new Error(`未找到对话 ${id}，请刷新后重试。`);
+      const row = rowById.get(id) || {
+        id,
+        title: id,
+        cwd: snapshot.header.cwd || '',
+        createdAt: snapshot.header.createdAt,
+        archived: false,
+        workspaceTitle: snapshot.header.cwd ? basename(snapshot.header.cwd) : null,
+      };
+      const events = await this.readSessionEvents(id);
+      const md = formatSessionMarkdown(row, snapshot.header, events);
+      const jsonl = formatSessionJsonl(snapshot.header, events);
+      records.push({ id, row, header: snapshot.header, eventsCount: events.length, md, jsonl });
+    }
+
+    const dateStr = new Date().toISOString().slice(0, 10);
+    let filename;
+    let mediaType;
+    let buffer;
+
+    if (records.length === 1 && !options.workspaceTitle && format === 'md') {
+      const item = records[0];
+      const shortId = item.id.replace(/^session-/, '').slice(0, 8);
+      filename = `${sanitizeFileName(item.row.title, shortId)}-${shortId}.md`;
+      mediaType = 'text/markdown; charset=utf-8';
+      buffer = Buffer.from(item.md, 'utf8');
+    } else if (records.length === 1 && !options.workspaceTitle && format === 'jsonl') {
+      const item = records[0];
+      const shortId = item.id.replace(/^session-/, '').slice(0, 8);
+      filename = `${sanitizeFileName(item.row.title, shortId)}-${shortId}.jsonl`;
+      mediaType = 'application/x-ndjson; charset=utf-8';
+      buffer = Buffer.from(item.jsonl, 'utf8');
+    } else {
+      const entries = [];
+      for (let i = 0; i < records.length; i++) {
+        const item = records[i];
+        const shortId = item.id.replace(/^session-/, '').slice(0, 8);
+        const folder = `${String(i + 1).padStart(2, '0')}-${sanitizeFileName(item.row.title, shortId)}-${shortId}`;
+        if (format !== 'jsonl') entries.push({ name: `${folder}/transcript.md`, data: item.md, mtime: item.header.createdAt });
+        if (format !== 'md') entries.push({ name: `${folder}/events.jsonl`, data: item.jsonl, mtime: item.header.createdAt });
+        entries.push({
+          name: `${folder}/meta.json`,
+          data: JSON.stringify({
+            id: item.id,
+            title: item.row.title,
+            workspaceTitle: item.row.workspaceTitle,
+            cwd: item.header.cwd || null,
+            createdAt: item.header.createdAt,
+            archived: !!item.row.archived,
+            eventsCount: item.eventsCount,
+          }, null, 2) + '\n',
+          mtime: item.header.createdAt,
+        });
+      }
+      entries.push({
+        name: 'manifest.json',
+        data: JSON.stringify({
+          exportedAt: new Date().toISOString(),
+          workspaceTitle: options.workspaceTitle || null,
+          format,
+          sessionCount: records.length,
+          sessions: records.map(item => ({
+            id: item.id,
+            title: item.row.title,
+            workspaceTitle: item.row.workspaceTitle,
+            cwd: item.header.cwd || null,
+            createdAt: item.header.createdAt,
+            archived: !!item.row.archived,
+            eventsCount: item.eventsCount,
+          })),
+        }, null, 2) + '\n',
+      });
+      if (options.workspaceTitle) {
+        filename = `${sanitizeFileName(options.workspaceTitle, 'workspace')}-对话日志-${dateStr}.zip`;
+      } else if (records.length === 1) {
+        const shortId = records[0].id.replace(/^session-/, '').slice(0, 8);
+        filename = `${sanitizeFileName(records[0].row.title, shortId)}-${shortId}.zip`;
+      } else {
+        filename = `dsh-对话导出-${records.length}条-${dateStr}.zip`;
+      }
+      mediaType = 'application/zip';
+      buffer = createZipBuffer(entries);
+    }
+
+    const exportsDir = join(this.config.output, 'exports');
+    await mkdir(exportsDir, { recursive: true });
+    const savedPath = join(exportsDir, filename);
+    await writeFile(savedPath, buffer, { mode: 0o600 });
+
+    return {
+      filename,
+      mediaType,
+      sizeBytes: buffer.length,
+      savedPath,
+      count: records.length,
+      base64: buffer.toString('base64'),
+      message: `已导出 ${records.length} 条对话至 ${filename}。`,
+    };
+  }
+  async exportWorkspace(workspaceId, options = {}) {
+    if (typeof workspaceId !== 'string' || !workspaceId) throw new Error('请指定工作区。');
+    const scan = await this.scan();
+    const ws = scan.workspaces.find(item => item.id === workspaceId);
+    if (!ws) throw new Error('未找到指定工作区，请刷新后重试。');
+    if (ws.sessionIds.length === 0) {
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const filename = `${sanitizeFileName(ws.title, 'workspace')}-对话日志-${dateStr}.zip`;
+      const buffer = createZipBuffer([{
+        name: 'manifest.json',
+        data: JSON.stringify({
+          exportedAt: new Date().toISOString(),
+          workspaceId: ws.id,
+          workspaceTitle: ws.title,
+          path: ws.path,
+          sessionCount: 0,
+          sessions: [],
+        }, null, 2) + '\n',
+      }]);
+      const exportsDir = join(this.config.output, 'exports');
+      await mkdir(exportsDir, { recursive: true });
+      const savedPath = join(exportsDir, filename);
+      await writeFile(savedPath, buffer, { mode: 0o600 });
+      return {
+        filename,
+        mediaType: 'application/zip',
+        sizeBytes: buffer.length,
+        savedPath,
+        count: 0,
+        base64: buffer.toString('base64'),
+        message: `工作区「${ws.title}」暂无对话，已导出空清单压缩包 ${filename}。`,
+      };
+    }
+    return this.exportSessions(ws.sessionIds, { format: options.format || 'zip', workspaceTitle: ws.title });
+  }
   async deleteSessions(ids, options = {}) {
     const includeChildren = options.includeChildren !== false;
-    const preview = await this.preview(ids);
+    const allowActiveWorkspace = options.allowActiveWorkspace === true;
+    const preview = await this.preview(ids, { allowActiveWorkspace });
     await this.ctx.sessionPersistence.flush();
     const sessionsRoot = await canonical(this.config.sessions);
     const storageRoot = await canonical(this.config.storage);
@@ -218,6 +430,49 @@ export class SessionCleaner {
       message: `已永久删除 ${preview.selected.length} 个会话${targets.length > preview.selected.length ? `（含 ${targets.length - preview.selected.length} 个关联子会话）` : ''}，本地项目文件完好保留。`,
     };
   }
+  async deleteWorkspace(workspaceId) {
+    if (typeof workspaceId !== 'string' || !workspaceId) throw new Error('请指定要删除的工作区。');
+    const scan = await this.scan();
+    const ws = scan.workspaces.find(item => item.id === workspaceId);
+    if (!ws) throw new Error('未找到指定工作区，请刷新后重试。');
+    if (ws.runningCount > 0) {
+      throw new Error(`工作区「${ws.title}」内有 ${ws.runningCount} 条对话正在运行中，请先停止运行或切换到其他工作区后再删除整个工作区。`);
+    }
+
+    let deletedIds = [];
+    if (ws.deletableSessionIds.length > 0) {
+      const delResult = await this.deleteSessions(ws.deletableSessionIds, {
+        includeChildren: true,
+        allowActiveWorkspace: true,
+      });
+      deletedIds = delResult.deletedIds || [];
+    }
+
+    if (typeof this.ctx.workspaceRegistry.delete === 'function') {
+      await this.ctx.workspaceRegistry.delete(workspaceId);
+    }
+
+    const operation = this.tail.then(async () => {
+      delete this.history.workspaces?.[workspaceId];
+      for (const id of ws.sessionIds) {
+        delete this.history.deletedSessions?.[id];
+        delete this.history.unassociated?.[id];
+      }
+      observeWorkspaces(this.history, this.ctx.workspaceRegistry.list());
+      await atomicJson(this.historyPath, this.history);
+    });
+    this.tail = operation.catch(error => { this.historyError = String(error); });
+    await operation;
+
+    const refreshed = await this.scan();
+    return {
+      ...refreshed,
+      deletedWorkspaceId: workspaceId,
+      deletedIds,
+      count: deletedIds.length,
+      message: `已移除工作区「${ws.title}」并彻底清理其 ${ws.deletableSessionIds.length} 条 DSH 对话记录（本地项目文件夹 ${ws.path} 完好保留）。`,
+    };
+  }
   async exportPlan(ids) {
     const preview = await this.preview(ids);
     await this.ctx.sessionPersistence.flush();
@@ -268,7 +523,7 @@ export async function apply(ctx, config) {
     if (request.headers.get('x-dsh-cleaner-panel') !== '1') return json({ error: '请从会话清理面板访问。' }, 403);
     const rejection = authorize(request, peer);
     if (rejection) return json({ error: rejection.error }, rejection.status);
-    try { return json({ ...await cleaner.scan(), nonce, version: '0.2.1' }); }
+    try { return json({ ...await cleaner.scan(), nonce, version: '0.3.0' }); }
     catch (error) { return json({ error: error.message }, 400); }
   } }));
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: route + '/action', handler: async (req, res) => {
@@ -282,20 +537,36 @@ export async function apply(ctx, config) {
       let body = '';
       for await (const chunk of req) { body += chunk; if (body.length > 100000) throw new Error('请求过大。'); }
       const input = JSON.parse(body);
-      if (input.action === 'preview') return respond(await cleaner.preview(input.ids));
+      if (input.action === 'preview') return respond(await cleaner.preview(input.ids, { allowActiveWorkspace: input.allowActiveWorkspace === true }));
       if (input.action === 'confirm-category') return respond(await cleaner.confirmCategory(input.ids, input.category));
-      if (input.action === 'delete' && input.confirmed === true) return respond(await cleaner.deleteSessions(input.ids, { includeChildren: input.includeChildren !== false }));
+      if (input.action === 'delete' && input.confirmed === true) {
+        return respond(await cleaner.deleteSessions(input.ids, {
+          includeChildren: input.includeChildren !== false,
+          allowActiveWorkspace: input.allowActiveWorkspace === true,
+        }));
+      }
+      if (input.action === 'delete-workspace' && input.confirmed === true) {
+        return respond(await cleaner.deleteWorkspace(input.workspaceId));
+      }
+      if (input.action === 'export-sessions') {
+        return respond(await cleaner.exportSessions(input.ids, { format: input.format }));
+      }
+      if (input.action === 'export-workspace') {
+        return respond(await cleaner.exportWorkspace(input.workspaceId, { format: input.format }));
+      }
       if (input.action === 'export-plan' && input.confirmed === true) return respond(await cleaner.exportPlan(input.ids));
       return respond({ error: '操作无效。' }, 400);
     } catch (error) { respond({ error: error.message }, 400); }
   } }));
   ctx.effect(() => ctx.tools.register({
-    name: 'session_cleaner_preview', description: '查看会话清理分类、指定会话的删除预览，或在用户明确要求时永久删除指定归档/未分组会话（绝不触碰本地项目文件）。',
+    name: 'session_cleaner_preview', description: '查看会话清理与工作区列表、导出对话或工作区压缩包，或在用户明确要求时永久删除指定会话或工作区（绝不触碰本地项目文件）。',
     parameters: {
       type: 'object',
       properties: {
-        ids: { type: 'array', items: { type: 'string' }, description: '要预览或删除的会话 ID；省略时返回分类计数和前 50 项。' },
-        action: { type: 'string', enum: ['scan', 'preview', 'delete'], description: '默认只读 scan/preview；仅在用户明确要求删除指定会话时传 delete。' },
+        ids: { type: 'array', items: { type: 'string' }, description: '要预览、导出或删除的会话 ID；省略时返回全部分类计数和列表摘要。' },
+        workspaceId: { type: 'string', description: '要导出压缩包或删除的工作区 ID。' },
+        format: { type: 'string', enum: ['zip', 'md', 'jsonl'], description: '导出对话格式，默认 zip。' },
+        action: { type: 'string', enum: ['scan', 'preview', 'delete', 'delete_workspace', 'export_sessions', 'export_workspace'], description: '默认只读 scan/preview；支持 export_sessions、export_workspace、delete、delete_workspace。' },
       },
       additionalProperties: false,
     },
@@ -303,11 +574,33 @@ export async function apply(ctx, config) {
     async execute(args) {
       if (args?.action === 'delete') {
         if (!args.ids?.length) throw new Error('删除操作必须指定会话 ID。');
-        return cleaner.deleteSessions(args.ids, { includeChildren: true });
+        return cleaner.deleteSessions(args.ids, { includeChildren: true, allowActiveWorkspace: true });
       }
-      if (args?.ids) return cleaner.preview(args.ids);
+      if (args?.action === 'delete_workspace') {
+        if (!args.workspaceId) throw new Error('必须指定工作区 ID。');
+        return cleaner.deleteWorkspace(args.workspaceId);
+      }
+      if (args?.action === 'export_sessions') {
+        if (!args.ids?.length) throw new Error('导出对话必须指定会话 ID。');
+        const exported = await cleaner.exportSessions(args.ids, { format: args.format });
+        const { base64, ...summary } = exported;
+        return summary;
+      }
+      if (args?.action === 'export_workspace') {
+        if (!args.workspaceId) throw new Error('导出工作区必须指定工作区 ID。');
+        const exported = await cleaner.exportWorkspace(args.workspaceId, { format: args.format });
+        const { base64, ...summary } = exported;
+        return summary;
+      }
+      if (args?.ids) return cleaner.preview(args.ids, { allowActiveWorkspace: true });
       const result = await cleaner.scan();
-      return { ...result, total: result.rows.length, rows: result.rows.slice(0, 50), truncated: result.rows.length > 50 };
+      return {
+        ...result,
+        total: result.rows.length,
+        rows: result.rows.slice(0, 50),
+        allSessions: result.allSessions.slice(0, 50),
+        truncated: result.rows.length > 50 || result.allSessions.length > 50,
+      };
     },
   }));
 }

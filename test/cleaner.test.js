@@ -70,11 +70,17 @@ async function fixture(t) {
   ];
   const ctx = {
     workspaceRegistry: {
-      list: () => [{
-        id: 'w',
-        ...workspaces.w,
-        detachSession: async sid => { workspaces.w.sessionIds = workspaces.w.sessionIds.filter(item => item !== sid); },
-      }],
+      list: () => Object.entries(workspaces).map(([wid, w]) => ({
+        id: wid,
+        ...w,
+        detachSession: async sid => { w.sessionIds = w.sessionIds.filter(item => item !== sid); },
+      })),
+      delete: async wid => {
+        if (!workspaces[wid]) return false;
+        delete workspaces[wid];
+        global.workspaceIds = global.workspaceIds.filter(item => item !== wid);
+        return true;
+      },
       unarchiveSession: async sid => { global.archivedSessionIds = global.archivedSessionIds.filter(item => item !== sid); },
       unpinSession: async sid => { global.pinnedSessionIds = global.pinnedSessionIds.filter(item => item !== sid); },
     },
@@ -83,6 +89,15 @@ async function fixture(t) {
       list: async () => snapshots,
       flush: async () => {},
       stat: async sid => snapshots.find(item => item.header.id === sid) || null,
+      open: async sid => ({
+        read: async () => ({
+          events: [
+            { seq: 1, type: 'user/message', timestamp: 1700000000000, data: { role: 'user', content: [{ type: 'text', text: `来自 ${sid} 的提问` }] } },
+            { seq: 2, type: 'assistant/message', timestamp: 1700000001000, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'thinking', thinking: '思考过程' }, { type: 'text', text: '回答内容' }] } } },
+          ],
+        }),
+        close: async () => {},
+      }),
     },
     sessionController: { list: async () => ({ items: [] }) },
   };
@@ -276,3 +291,60 @@ test('会话符号链接和非规范存储路径被拒绝', async t => {
   await symlink(f.storage, alias);
   await assert.rejects(canonical(alias), /符号链接/);
 });
+
+test('所有对话与所有工作区计数、导出对话 (.zip / .md / .jsonl) 与导出整工作区压缩包', async t => {
+  const f = await fixture(t);
+  const scan = await f.cleaner.scan();
+  assert.equal(scan.counts.all_sessions, 2);
+  assert.equal(scan.counts.all_workspaces, 1);
+  assert.equal(scan.workspaces[0].title, '项目');
+  assert.equal(scan.workspaces[0].totalCount, 2);
+
+  const mdExport = await f.cleaner.exportSessions([id(1)], { format: 'md' });
+  assert.match(mdExport.filename, /\.md$/);
+  const mdText = Buffer.from(mdExport.base64, 'base64').toString('utf8');
+  assert.match(mdText, /来自 session-00000000-0000-0000-0000-000000000001 的提问/);
+  assert.match(mdText, /回答内容/);
+
+  const jsonlExport = await f.cleaner.exportSessions([id(1)], { format: 'jsonl' });
+  assert.match(jsonlExport.filename, /\.jsonl$/);
+  const jsonlLines = Buffer.from(jsonlExport.base64, 'base64').toString('utf8').trim().split('\n');
+  assert.equal(jsonlLines.length, 3);
+
+  const wsZip = await f.cleaner.exportWorkspace('w');
+  assert.match(wsZip.filename, /^项目-对话日志-.*\.zip$/);
+  const verifyPy = `
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], 'r') as zf:
+    assert zf.testzip() is None
+    names = zf.namelist()
+    assert 'manifest.json' in names
+    assert any(n.endswith('/transcript.md') for n in names)
+    assert any(n.endswith('/events.jsonl') for n in names)
+print('ZIP_OK')
+`;
+  const checkOut = execFileSync('python3', ['-c', verifyPy, wsZip.savedPath], { encoding: 'utf8' });
+  assert.match(checkOut, /ZIP_OK/);
+});
+
+test('删除工作区同时移除工作区注册与其所有会话，且保护运行中工作区与本地项目目录', async t => {
+  const f = await fixture(t);
+  const dir2 = join(f.root, 'sessions', 'project-key', id(2));
+  await mkdir(dir2, { recursive: true });
+  await writeFile(join(dir2, 'session.v4.jsonl'), '未归档工作区对话\n');
+  f.snapshots[1].location = { kind: 'jsonl', path: join(dir2, 'session.v4.jsonl') };
+  await writeFile(join(f.project, 'main.py'), 'print(1)');
+
+  f.ctx.sessionController.list = async () => ({ items: [{ sessionId: id(2), running: true }] });
+  await assert.rejects(f.cleaner.deleteWorkspace('w'), /正在运行/);
+
+  f.ctx.sessionController.list = async () => ({ items: [] });
+  const res = await f.cleaner.deleteWorkspace('w');
+  assert.equal(res.counts.all_workspaces, 0);
+  assert.deepEqual(new Set(res.deletedIds), new Set([id(1), id(2), id(3)]));
+  await assert.rejects(stat(f.dir));
+  await assert.rejects(stat(dir2));
+  await assert.rejects(stat(f.dir3));
+  assert.equal(await readFile(join(f.project, 'main.py'), 'utf8'), 'print(1)');
+});
+

@@ -4,10 +4,10 @@
 
 ## 项目内目录结构
 
-- `index.js` / `core.js`：Host 端插件入口、会话分类、安全边界校验与在线永久删除逻辑。
+- `index.js` / `core.js`：Host 端插件入口、六板块会话与工作区汇总、Markdown/JSONL/ZIP 导出打包器、安全边界校验与在线永久删除逻辑。
 - `client.js`：Web / Desktop 客户端面板 UI（挂载在左侧栏“记忆系统”下方）。
 - `offline.py`：可选的离线维护与备份恢复脚本（仅使用 Python 3 标准库）。
-- `runtime/`：运行期生成的本地状态目录（含 `workspace-history.json`），已列入 `.gitignore`，不纳入版本控制。
+- `runtime/`：运行期生成的本地状态目录（含 `workspace-history.json` 与 `exports/` 导出副本），已列入 `.gitignore`，不纳入版本控制。
 - `.cache/npm/`：项目级 npm 缓存目录，已列入 `.gitignore`。
 - `test/`：JavaScript 与 Python 自动化测试套件，测试夹具在运行结束后自动清理。
 
