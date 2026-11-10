@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="会话清理">
+  <rect x="3" y="3" width="58" height="58" rx="17" fill="#eee8df"/>
+  <g fill="none" stroke="#8e5841" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M15 21h34v9H15zM19 30v20h26V30M27 37h10"/>
+    <path d="M40 14l3-5M49 18l5-2M31 13V8"/>
+  </g>
+</svg>

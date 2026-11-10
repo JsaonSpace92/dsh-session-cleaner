@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-session-cleaner
+      name: dsh-session-cleaner
+      config:
+        sessions: !!js dshHomePath('sessions')
+        storage: !!js dshHomePath('storages')
